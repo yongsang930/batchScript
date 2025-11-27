@@ -1,8 +1,6 @@
 import logging
 from rss_batch_service import RssBatchService
-from config import load_env_file, get_db_config, setup_logging
-
-load_env_file()
+from config import get_db_config, setup_logging
 setup_logging()
 logger = logging.getLogger("batch")
 

@@ -1,7 +1,9 @@
 import hashlib
+import json
 import time
+import re
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 
 import feedparser
 import psycopg2
@@ -13,7 +15,6 @@ from config import get_batch_settings
 def _clean_text(text: Optional[str]) -> str:
     if not text:
         return ""
-    # 공백만 정리, HTML은 피드마다 다르니 그대로 둠
     return " ".join(str(text).split())
 
 
@@ -66,9 +67,60 @@ class RssBatchService:
     def __init__(self, db_config: dict):
         self.db_config = db_config
         self.logger = logging.getLogger("rss-batch")
+        self._active_keywords_cache: Optional[List[Dict]] = None
 
     def _get_conn(self):
         return psycopg2.connect(**self.db_config)
+
+    def _fetch_active_keywords(self) -> List[Dict]:
+        """활성 키워드 목록을 가져옵니다 (캐시 사용)."""
+        if self._active_keywords_cache is not None:
+            return self._active_keywords_cache
+
+        conn = self._get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT keyword_id, en_name, ko_name
+                FROM keywords
+                WHERE is_active = TRUE AND deleted_at IS NULL
+                """
+            )
+            rows = cur.fetchall()
+            keywords = [
+                {
+                    'keyword_id': r[0],
+                    'en_name': r[1],
+                    'ko_name': r[2],
+                }
+                for r in rows
+            ]
+            self._active_keywords_cache = keywords
+            return keywords
+        finally:
+            cur.close()
+            conn.close()
+
+    def _match_keywords(self, title: str, summary: str, keywords: List[Dict]) -> Set[int]:
+        """제목과 요약에서 키워드를 매칭하여 keyword_id 집합을 반환합니다."""
+        matched_keyword_ids: Set[int] = set()
+        search_text = f"{title} {summary}".lower()
+        
+        for kw in keywords:
+            en_name = kw['en_name'].lower()
+            ko_name = kw['ko_name']
+            
+            if en_name:
+                pattern = r'\b' + re.escape(en_name) + r'\b'
+                if re.search(pattern, search_text, re.IGNORECASE):
+                    matched_keyword_ids.add(kw['keyword_id'])
+            
+            if ko_name:
+                if ko_name in title or ko_name in summary:
+                    matched_keyword_ids.add(kw['keyword_id'])
+        
+        return matched_keyword_ids
 
     def fetch_active_feeds(self) -> List[Dict]:
         conn = self._get_conn()
@@ -112,8 +164,9 @@ class RssBatchService:
                 success_count += 1
                 total_new += new_count
                 total_duplicate += dup_count
-            except Exception:
+            except Exception as e:
                 fail_count += 1
+                self.logger.error(f"피드 처리 실패 [{f['feed_url']}]: {str(e)[:500]}")
 
         elapsed = time.time() - start_time
         self.logger.info(f"수집 완료 - 성공: {success_count}, 실패: {fail_count}")
@@ -138,7 +191,7 @@ class RssBatchService:
             self.logger.error(f"  └─ 실패: {error_message}")
 
         finally:
-            self._log_crawl(feed_id, status, collected, error_message)
+            self._log_batch(feed_id, url, status, collected, error_message)
             self._touch_last_crawled(feed_id)
 
         return new_count, dup_count
@@ -151,24 +204,35 @@ class RssBatchService:
         cur = conn.cursor()
 
         try:
+            active_keywords = self._fetch_active_keywords()
+            
             values_posts = []
             link_hashes = []
+            post_data_map = {}
+            
             for p in posts:
                 link = p['link']
                 link_hash = hashlib.sha256((link or '').encode('utf-8')).hexdigest()
                 link_hashes.append(link_hash)
+                
+                # published_at이 None이면 현재 시간 사용 (NOT NULL 제약조건 대응)
+                published_at = p['published_at'] if p['published_at'] else datetime.now()
+                
                 values_posts.append((
                     p['title'] or '',
                     link,
                     link_hash,
                     p['summary'] or '',
                     region,
-                    p['published_at'],
+                    published_at,
                 ))
+                post_data_map[link_hash] = {
+                    'title': p['title'] or '',
+                    'summary': p['summary'] or '',
+                }
 
-            # 중복 체크용
             cur.execute(
-                f"SELECT link_hash FROM posts WHERE link_hash = ANY(%s)",
+                "SELECT link_hash FROM posts WHERE link_hash = ANY(%s)",
                 (link_hashes,)
             )
             existing_hashes = {row[0] for row in cur.fetchall()}
@@ -185,6 +249,49 @@ class RssBatchService:
                 values_posts,
             )
 
+            cur.execute(
+                """
+                SELECT post_id, link_hash
+                FROM posts
+                WHERE link_hash = ANY(%s)
+                """,
+                (link_hashes,)
+            )
+            
+            all_post_mappings = {row[1]: row[0] for row in cur.fetchall()}
+            new_post_mappings = {
+                link_hash: post_id
+                for link_hash, post_id in all_post_mappings.items()
+                if link_hash not in existing_hashes
+            }
+
+            post_keywords_values = []
+            for link_hash, post_id in new_post_mappings.items():
+                post_data = post_data_map.get(link_hash)
+                if not post_data:
+                    continue
+                
+                matched_keyword_ids = self._match_keywords(
+                    post_data['title'],
+                    post_data['summary'],
+                    active_keywords
+                )
+                
+                for keyword_id in matched_keyword_ids:
+                    post_keywords_values.append((post_id, keyword_id))
+
+            if post_keywords_values:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO post_keywords (post_id, keyword_id)
+                    VALUES %s
+                    ON CONFLICT (post_id, keyword_id) DO NOTHING
+                    """,
+                    post_keywords_values,
+                )
+                self.logger.debug(f"키워드 매핑 {len(post_keywords_values)}개 추가")
+
             conn.commit()
             return new_count, duplicate_count
 
@@ -195,16 +302,25 @@ class RssBatchService:
             cur.close()
             conn.close()
 
-    def _log_crawl(self, feed_id: int, status: str, collected_count: int, error_message: Optional[str]) -> None:
+    def _log_batch(self, feed_id: int, feed_url: str, status: str, collected_count: int, error_message: Optional[str]) -> None:
+        """batch_logs 테이블에 배치 실행 로그를 기록합니다."""
         conn = self._get_conn()
         cur = conn.cursor()
         try:
+            detail = {
+                "feed_id": feed_id,
+                "feed_url": feed_url,
+                "collected": collected_count,
+            }
+            
+            log_level = "ERROR" if status == "FAILED" else "INFO"
+            
             cur.execute(
                 """
-                INSERT INTO crawl_logs (feed_id, status, collected_count, error_message)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO batch_logs (job_type, log_level, status, affected_count, detail, error_message)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
-                (feed_id, status, collected_count, error_message),
+                ("RSS_CRAWLER", log_level, status, collected_count, json.dumps(detail), error_message),
             )
             conn.commit()
         finally:
