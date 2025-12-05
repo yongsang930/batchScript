@@ -31,18 +31,18 @@ def _parse_feed(url: str) -> List[Dict]:
         title = _clean_text(getattr(entry, 'title', '') or '')
         link = getattr(entry, 'link', '') or ''
 
-        summary = None
+        content = None
         if getattr(entry, 'summary', None):
-            summary = entry.summary
+            content = entry.summary
         elif getattr(entry, 'description', None):
-            summary = entry.description
+            content = entry.description
         elif getattr(entry, 'content', None):
             c = entry.content
             if isinstance(c, list) and c:
-                summary = c[0].value
+                content = c[0].value
             elif isinstance(c, str):
-                summary = c
-        summary = _clean_text(summary or '')
+                content = c
+        content = _clean_text(content or '')
 
         published_dt: Optional[datetime] = None
         try:
@@ -56,7 +56,7 @@ def _parse_feed(url: str) -> List[Dict]:
         posts.append({
             'title': title,
             'link': link,
-            'summary': summary,
+            'content': content,
             'published_at': published_dt,
         })
 
@@ -102,10 +102,10 @@ class RssBatchService:
             cur.close()
             conn.close()
 
-    def _match_keywords(self, title: str, summary: str, keywords: List[Dict]) -> Set[int]:
-        """제목과 요약에서 키워드를 매칭하여 keyword_id 집합을 반환합니다."""
+    def _match_keywords(self, title: str, content: str, keywords: List[Dict]) -> Set[int]:
+        """제목과 내용에서 키워드를 매칭하여 keyword_id 집합을 반환합니다."""
         matched_keyword_ids: Set[int] = set()
-        search_text = f"{title} {summary}".lower()
+        search_text = f"{title} {content}".lower()
         
         for kw in keywords:
             en_name = kw['en_name'].lower()
@@ -117,7 +117,7 @@ class RssBatchService:
                     matched_keyword_ids.add(kw['keyword_id'])
             
             if ko_name:
-                if ko_name in title or ko_name in summary:
+                if ko_name in title or ko_name in content:
                     matched_keyword_ids.add(kw['keyword_id'])
         
         return matched_keyword_ids
@@ -222,13 +222,13 @@ class RssBatchService:
                     p['title'] or '',
                     link,
                     link_hash,
-                    p['summary'] or '',
+                    p['content'] or '',
                     region,
                     published_at,
                 ))
                 post_data_map[link_hash] = {
                     'title': p['title'] or '',
-                    'summary': p['summary'] or '',
+                    'content': p['content'] or '',
                 }
 
             cur.execute(
@@ -242,7 +242,7 @@ class RssBatchService:
             execute_values(
                 cur,
                 """
-                INSERT INTO posts (title, link, link_hash, summary, region, published_at)
+                INSERT INTO posts (title, link, link_hash, content, region, published_at)
                 VALUES %s
                 ON CONFLICT (link_hash) DO NOTHING
                 """,
@@ -273,7 +273,7 @@ class RssBatchService:
                 
                 matched_keyword_ids = self._match_keywords(
                     post_data['title'],
-                    post_data['summary'],
+                    post_data['content'],
                     active_keywords
                 )
                 

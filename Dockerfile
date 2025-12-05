@@ -19,7 +19,7 @@ RUN echo '#!/bin/bash\ncd /app\nsource /etc/environment\n/usr/local/bin/python3 
     > /app/run_batch.sh && chmod +x /app/run_batch.sh
 
 # cron 스케줄 — bash로 명시
-RUN echo '0 * * * * root bash -c "source /etc/environment && /app/run_batch.sh" >> /var/log/batch.log 2>&1' \
+RUN echo '0 0 * * * root bash -c "source /etc/environment && /app/run_batch.sh" >> /var/log/batch.log 2>&1' \
     > /etc/cron.d/rss-cron && chmod 0644 /etc/cron.d/rss-cron
 
 # 로그파일
