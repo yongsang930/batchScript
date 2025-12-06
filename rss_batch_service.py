@@ -2,48 +2,73 @@ import hashlib
 import json
 import time
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Set
 
 import feedparser
 import psycopg2
 from psycopg2.extras import execute_values
 import logging
+from bs4 import BeautifulSoup
 from config import get_batch_settings
 
 
+def _extract_text_from_html(html: Optional[str]) -> str:
+    """HTML에서 텍스트만 추출합니다."""
+    if not html:
+        return ""
+    
+    try:
+        # BeautifulSoup으로 HTML 파싱
+        soup = BeautifulSoup(str(html), 'html.parser')
+        
+        # 스크립트와 스타일 태그 제거
+        for script in soup(["script", "style", "noscript"]):
+            script.decompose()
+        
+        # 텍스트 추출 및 정리
+        text = soup.get_text(separator=' ', strip=True)
+        
+        # 여러 공백을 하나로 정리
+        text = re.sub(r'\s+', ' ', text)
+        
+        return text.strip()
+    except Exception:
+        # HTML 파싱 실패 시 원본 텍스트 반환
+        return str(html)
+
+
 def _clean_text(text: Optional[str]) -> str:
+    """텍스트를 정리합니다. HTML이 포함된 경우 파싱하여 텍스트만 추출합니다."""
     if not text:
         return ""
-    return " ".join(str(text).split())
+    
+    text_str = str(text)
+    
+    # HTML 태그가 포함되어 있는지 확인 (<로 시작하고 >로 끝나는 태그 패턴)
+    if re.search(r'<[^>]+>', text_str):
+        # HTML이 포함된 경우 파싱
+        return _extract_text_from_html(text_str)
+    else:
+        # 일반 텍스트인 경우 공백만 정리
+        return " ".join(text_str.split())
 
 
 def _parse_feed(url: str) -> List[Dict]:
     settings = get_batch_settings()
     posts: List[Dict] = []
+    
+    # 최근 1년 기준 날짜 계산
+    one_year_ago = datetime.now() - timedelta(days=365)
 
     feedparser.USER_AGENT = settings["USER_AGENT"]
     feed = feedparser.parse(url)
 
     max_items = settings["MAX_ITEMS_PER_FEED"]
+    skipped_old = 0
 
     for entry in feed.entries[:max_items]:
-        title = _clean_text(getattr(entry, 'title', '') or '')
-        link = getattr(entry, 'link', '') or ''
-
-        content = None
-        if getattr(entry, 'summary', None):
-            content = entry.summary
-        elif getattr(entry, 'description', None):
-            content = entry.description
-        elif getattr(entry, 'content', None):
-            c = entry.content
-            if isinstance(c, list) and c:
-                content = c[0].value
-            elif isinstance(c, str):
-                content = c
-        content = _clean_text(content or '')
-
+        # published_at를 먼저 확인하여 1년 이내인지 체크
         published_dt: Optional[datetime] = None
         try:
             if getattr(entry, 'published_parsed', None):
@@ -52,6 +77,37 @@ def _parse_feed(url: str) -> List[Dict]:
                 published_dt = datetime(*entry.updated_parsed[:6])
         except Exception:
             published_dt = None
+
+        # published_at가 없거나 1년 이전이면 pass
+        if published_dt is None or published_dt < one_year_ago:
+            skipped_old += 1
+            continue
+
+        title = _clean_text(getattr(entry, 'title', '') or '')
+        link = getattr(entry, 'link', '') or ''
+
+        # content 수집: 여러 소스에서 시도하고, HTML이 포함된 경우 파싱
+        content = None
+        if getattr(entry, 'summary', None):
+            content = entry.summary
+        elif getattr(entry, 'description', None):
+            content = entry.description
+        elif getattr(entry, 'content', None):
+            c = entry.content
+            if isinstance(c, list) and c:
+                # content 리스트의 모든 항목을 시도
+                for item in c:
+                    if hasattr(item, 'value'):
+                        content = item.value
+                        break
+                    elif isinstance(item, str):
+                        content = item
+                        break
+            elif isinstance(c, str):
+                content = c
+        
+        # HTML 파싱 및 텍스트 추출
+        content = _clean_text(content or '')
 
         posts.append({
             'title': title,
@@ -111,11 +167,79 @@ class RssBatchService:
             en_name = kw['en_name'].lower()
             ko_name = kw['ko_name']
             
+            # 영어 키워드 매칭 개선
             if en_name:
-                pattern = r'\b' + re.escape(en_name) + r'\b'
-                if re.search(pattern, search_text, re.IGNORECASE):
-                    matched_keyword_ids.add(kw['keyword_id'])
+                # 특수 케이스: "Go" 언어는 너무 짧아서 잘못 매칭될 수 있음
+                # "go" 단독 매칭은 제외하고 "golang", "go programming", "go language" 등 컨텍스트 확인
+                if en_name == 'go':
+                    # Go 언어 관련 컨텍스트 확인
+                    go_contexts = [
+                        r'\bgolang\b',
+                        r'\bgo\s+programming\b',
+                        r'\bgo\s+language\b',
+                        r'\bgo\s+code\b',
+                        r'\bgo\s+developer\b',
+                        r'\bgo\s+package\b',
+                        r'\bgo\s+module\b',
+                        r'\bgo\s+runtime\b',
+                        r'\bgo\s+goroutine\b',
+                        r'\bgo\s+channel\b',
+                        r'\bgo\s+interface\b',
+                        r'\bprogramming\s+in\s+go\b',
+                        r'\bwritten\s+in\s+go\b',
+                        r'\bbuilt\s+with\s+go\b',
+                    ]
+                    matched = False
+                    for context_pattern in go_contexts:
+                        if re.search(context_pattern, search_text, re.IGNORECASE):
+                            matched = True
+                            break
+                    if matched:
+                        matched_keyword_ids.add(kw['keyword_id'])
+                # 공백이나 하이픈이 포함된 복합 키워드 처리
+                # 예: "Next js", "GitHub Actions", "On-device AI", "RESTful API"
+                elif ' ' in en_name or '-' in en_name:
+                    # 복합 키워드는 여러 변형으로 매칭 시도
+                    patterns = [
+                        r'\b' + re.escape(en_name) + r'\b',  # 원본: "on-device ai"
+                        r'\b' + re.escape(en_name.replace('-', ' ')) + r'\b',  # 하이픈을 공백으로: "on device ai"
+                        r'\b' + re.escape(en_name.replace('-', '')) + r'\b',  # 하이픈 제거: "ondevice ai"
+                    ]
+                    # 중복 제거
+                    patterns = list(dict.fromkeys(patterns))
+                    
+                    for pattern in patterns:
+                        if re.search(pattern, search_text, re.IGNORECASE):
+                            matched_keyword_ids.add(kw['keyword_id'])
+                            break
+                else:
+                    # 단일 단어 키워드는 단어 경계로 매칭
+                    # 단, 너무 짧은 키워드(2글자 이하)는 제외 (잘못된 매칭 방지)
+                    if len(en_name) > 2:
+                        pattern = r'\b' + re.escape(en_name) + r'\b'
+                        if re.search(pattern, search_text, re.IGNORECASE):
+                            matched_keyword_ids.add(kw['keyword_id'])
+                
+                # 키워드 변형 처리 (예: "PostgreSQL" vs "Postgres", "Node.js" vs "Node js", "NestJS" vs "Nest.js")
+                # 단, "go"는 이미 특수 처리했으므로 제외
+                if en_name != 'go' and ' ' not in en_name and '-' not in en_name:
+                    en_variants = [
+                        en_name.replace('.', '').replace(' ', ''),  # 점과 공백 제거
+                        en_name.replace('.', ' '),  # 점을 공백으로
+                        en_name.replace(' ', ''),  # 공백 제거
+                        en_name.lower(),  # 소문자 변환 (대소문자 혼합 대응)
+                    ]
+                    # 중복 제거
+                    en_variants = list(dict.fromkeys([v for v in en_variants if v != en_name]))
+                    
+                    for variant in en_variants:
+                        if len(variant) > 2:  # 너무 짧은 변형은 제외
+                            pattern = r'\b' + re.escape(variant) + r'\b'
+                            if re.search(pattern, search_text, re.IGNORECASE):
+                                matched_keyword_ids.add(kw['keyword_id'])
+                                break
             
+            # 한국어 키워드 매칭
             if ko_name:
                 if ko_name in title or ko_name in content:
                     matched_keyword_ids.add(kw['keyword_id'])
@@ -183,6 +307,7 @@ class RssBatchService:
             posts = _parse_feed(url)
             collected = len(posts)
             new_count, dup_count = self._save_posts_and_mappings(posts, region)
+            # 1년 이전 포스트는 _parse_feed에서 필터링되어 collected에 포함되지 않음
             self.logger.info(f"  └─ 수집: {collected}개 (신규: {new_count}, 중복: {dup_count})")
 
         except Exception as e:
