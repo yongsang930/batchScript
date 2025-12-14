@@ -1,29 +1,58 @@
-# 환경변수
-.env
-
-#기타 참조파일
-feeds.json
+# Environment variables
 requirements.txt
-batchScript.sql
-
-# 로그
+*.sql
 logs/
-*.log
-
-# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
+config.py
+.venv/
 
-# IDE
+# Essential
+node_modules/
+dist/
+build/
+
+
+# Environment Files
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+
+
+# IDE / Editor
 .vscode/
 .idea/
+*.iml
+
+# System Files
+.DS_Store
+Thumbs.db
+*.log
+*.temp
+
+# Vite / Package Managers
+.vite/
+.npm/
+.yarn/
+.pnpm-store/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+
+# Testing
+coverage/
+*.lcov
+
+# Misc
 *.swp
 *.swo
-config.py
 
-# dir
-__pycache__/
-.venv/
+.Cursorrules
+
+.DS_Store
+Thumbs.db
+*.log
+
+.vite/
