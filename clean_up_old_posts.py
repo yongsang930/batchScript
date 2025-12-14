@@ -39,6 +39,21 @@ DELETE FROM posts
 WHERE post_id = %s;
 """
 
+SQL_FIND_ZOMBIE_POSTS = """
+SELECT p.post_id
+FROM posts p
+LEFT JOIN post_keywords pk ON p.post_id = pk.post_id
+WHERE pk.post_id IS NULL;
+"""
+
+SQL_FIND_POSTS_WITHOUT_ACTIVE_KEYWORDS = """
+SELECT DISTINCT p.post_id
+FROM posts p
+INNER JOIN post_keywords pk ON p.post_id = pk.post_id
+LEFT JOIN keywords k ON pk.keyword_id = k.keyword_id AND k.is_active = TRUE
+WHERE k.keyword_id IS NULL;
+"""
+
 def _get_conn():
     return psycopg2.connect(**get_db_config())
 
@@ -129,6 +144,53 @@ def run():
             total_deleted_posts += deleted_posts_count
             total_deleted_mappings += deleted_mappings_count
             logger.info(f"  └─ 완료: 포스트 {deleted_posts_count}개, 매핑 {deleted_mappings_count}개 삭제")
+
+        # 키워드 매핑이 전혀 없는 좀비 포스트 정리
+        logger.info("키워드 매핑이 없는 좀비 포스트 정리 시작...")
+        cur.execute(SQL_FIND_ZOMBIE_POSTS)
+        zombie_posts = cur.fetchall()
+        zombie_count = len(zombie_posts)
+        
+        if zombie_count > 0:
+            logger.info(f"  └─ 매핑 없는 좀비 포스트 {zombie_count}개 발견")
+            deleted_zombie_count = 0
+            for (post_id,) in zombie_posts:
+                cur.execute(SQL_DELETE_POST, (post_id,))
+                deleted_zombie_count += 1
+                logger.debug(f"    └─ post_id={post_id} 삭제됨 (매핑 없음)")
+            conn.commit()
+            total_deleted_posts += deleted_zombie_count
+            logger.info(f"  └─ 완료: 좀비 포스트 {deleted_zombie_count}개 삭제")
+        else:
+            logger.info(f"  └─ 매핑 없는 좀비 포스트 없음")
+
+        # 활성 키워드와 매핑되지 않은 포스트 정리 (비활성 키워드와만 매핑된 포스트)
+        logger.info("활성 키워드와 매핑되지 않은 포스트 정리 시작...")
+        cur.execute(SQL_FIND_POSTS_WITHOUT_ACTIVE_KEYWORDS)
+        inactive_posts = cur.fetchall()
+        inactive_count = len(inactive_posts)
+        
+        if inactive_count > 0:
+            logger.info(f"  └─ 활성 키워드와 매핑 안 된 포스트 {inactive_count}개 발견")
+            deleted_inactive_count = 0
+            deleted_inactive_mappings = 0
+            
+            for (post_id,) in inactive_posts:
+                # 해당 포스트의 모든 매핑 삭제
+                cur.execute("DELETE FROM post_keywords WHERE post_id = %s;", (post_id,))
+                deleted_inactive_mappings += cur.rowcount
+                
+                # 포스트 삭제
+                cur.execute(SQL_DELETE_POST, (post_id,))
+                deleted_inactive_count += 1
+                logger.debug(f"    └─ post_id={post_id} 삭제됨 (활성 키워드 매핑 없음)")
+            
+            conn.commit()
+            total_deleted_posts += deleted_inactive_count
+            total_deleted_mappings += deleted_inactive_mappings
+            logger.info(f"  └─ 완료: 포스트 {deleted_inactive_count}개, 매핑 {deleted_inactive_mappings}개 삭제")
+        else:
+            logger.info(f"  └─ 활성 키워드와 매핑 안 된 포스트 없음")
 
         elapsed = time.time() - start_time
         logger.info(f"정리 배치 완료 - 키워드: {total_keywords}개, 삭제된 포스트: {total_deleted_posts}개, 삭제된 매핑: {total_deleted_mappings}개, 소요시간: {elapsed:.2f}초")
